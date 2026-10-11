@@ -339,6 +339,18 @@ class PassiveTest(parameterized.TestCase):
       wp.capture_launch(capture.graph)
       np.testing.assert_array_equal(d.qfrc_gravcomp.numpy(), expected)
 
+    # Torch's default stream is external to Warp and cannot open this capture.
+    d._gravity_force_graph = None
+    wp.synchronize()
+    with wp.ScopedStream(wp.Stream(device=wp.get_device(), cuda_stream=0)):
+      m.body_gravcomp.fill_(0.25)
+      m.opt.graph_conditional = False
+      mjw.passive(m, d)
+      expected = d.qfrc_gravcomp.numpy().copy()
+      m.opt.graph_conditional = True
+      mjw.passive(m, d)
+      np.testing.assert_array_equal(d.qfrc_gravcomp.numpy(), expected)
+
   def test_polynomial_stiffness(self):
     """Tests polynomial stiffness."""
     xml = """

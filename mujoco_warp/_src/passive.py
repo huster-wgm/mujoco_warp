@@ -452,12 +452,16 @@ def _launch_gravity_force(m: Model, d: Data):
   key = (dim, tuple((value.ptr, value.shape, value.strides) for value in inputs + outputs))
   cached = getattr(d, "_gravity_force_graph", None)
   if cached is None or cached[0] != key:
-    active = wp.zeros(1, dtype=int, device=device)
-    with wp.ScopedCapture(device=device) as capture:
-      conditional(active)
+    # External/default CUDA streams may not support opening a Warp capture.
+    # Record on an owned stream; replay below stays on the caller's stream.
+    stream = wp.Stream(device=device)
+    active = wp.empty(1, dtype=int, device=device)
+    with wp.ScopedStream(stream, sync_enter=False, sync_exit=False):
+      with wp.ScopedCapture(device=device) as capture:
+        conditional(active)
     # Keep referenced arrays alive until this graph is replaced. Only one graph
     # is retained per Data, even when live compaction changes the batch shape.
-    cached = (key, capture.graph, active, inputs, outputs)
+    cached = (key, capture.graph, active, inputs, outputs, stream)
     d._gravity_force_graph = cached
   wp.capture_launch(cached[1])
 
