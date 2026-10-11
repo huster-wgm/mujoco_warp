@@ -277,10 +277,10 @@ class PassiveTest(parameterized.TestCase):
       <mujoco>
         <option gravity="1 2 -9.81"><flag contact="disable"/></option>
         <worldbody>
-          <body pos="0 0 2">
+          <body pos="0 0 2" gravcomp="1">
             <joint type="free"/>
             <geom size=".1" mass="2"/>
-            <body pos=".2 0 0">
+            <body pos=".2 0 0" gravcomp="1">
               <joint type="hinge" axis="0 1 0"/>
               <geom size=".1" mass="1" pos=".1 0 0"/>
             </body>
