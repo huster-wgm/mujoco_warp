@@ -267,6 +267,78 @@ class PassiveTest(parameterized.TestCase):
     _assert_eq(d.qfrc_gravcomp.numpy()[0], mjd.qfrc_gravcomp, "qfrc_gravcomp")
     _assert_eq(d.qfrc_actuator.numpy()[0], mjd.qfrc_actuator, "qfrc_actuator")
 
+  @parameterized.parameters(1, 2)
+  def test_dynamic_gravcomp_conditional_graph(self, nworld):
+    """Preserves native sums through zero/nonzero edits, array replacement and capture."""
+    if not wp.get_device().is_cuda or tuple(map(int, wp.__version__.split(".")[:2])) < (1, 18):
+      self.skipTest("Device conditional native reductions require CUDA and Warp 1.18")
+    mjm, _, m, d = test_data.fixture(
+      xml="""
+      <mujoco>
+        <option gravity="1 2 -9.81"><flag contact="disable"/></option>
+        <worldbody>
+          <body pos="0 0 2">
+            <joint type="free"/>
+            <geom size=".1" mass="2"/>
+            <body pos=".2 0 0">
+              <joint type="hinge" axis="0 1 0"/>
+              <geom size=".1" mass="1" pos=".1 0 0"/>
+            </body>
+          </body>
+        </worldbody>
+      </mujoco>
+      """,
+      nworld=nworld,
+      qvel_noise=0.1,
+      batch_sizes={"body_gravcomp": nworld},
+      overrides={"opt.deterministic": mjw.DeterminismType.ALL},
+    )
+    cached_graph = None
+    for value in (0.0, 0.25, 1.0, 0.0):
+      coefficients = np.full((nworld, mjm.nbody), value, dtype=np.float32)
+      coefficients[:, 0] = 0
+      if nworld == 2:
+        coefficients[1, 1:] *= -0.5
+      m.body_gravcomp.assign(coefficients)
+      m.opt.graph_conditional = False
+      d.qfrc_gravcomp.fill_(wp.inf)
+      mjw.passive(m, d)
+      expected = d.qfrc_gravcomp.numpy().copy()
+      passive_expected = d.qfrc_passive.numpy().copy()
+      m.opt.graph_conditional = True
+      d.qfrc_gravcomp.fill_(wp.inf)
+      mjw.passive(m, d)
+      np.testing.assert_array_equal(d.qfrc_gravcomp.numpy(), expected)
+      np.testing.assert_array_equal(d.qfrc_passive.numpy(), passive_expected)
+      if value and nworld == 2:
+        self.assertFalse(np.array_equal(expected[0], expected[1]))
+      if cached_graph is not None:
+        self.assertIs(d._gravity_force_graph[1], cached_graph)
+      cached_graph = d._gravity_force_graph[1]
+      for world in range(nworld):
+        mjm.body_gravcomp[:] = coefficients[world]
+        reference = mujoco.MjData(mjm)
+        reference.qpos[:] = d.qpos.numpy()[world]
+        reference.qvel[:] = d.qvel.numpy()[world]
+        mujoco.mj_forward(mjm, reference)
+        _assert_eq(expected[world], reference.qfrc_gravcomp, "dynamic gravcomp CPU parity")
+
+    m.body_gravcomp = wp.full((nworld, mjm.nbody), 0.5, dtype=float)
+    mjw.passive(m, d)
+    self.assertIsNot(d._gravity_force_graph[1], cached_graph)
+    with wp.ScopedCapture() as capture:
+      mjw.passive(m, d)
+    # Replay after changing values, not just the values present during capture.
+    for value in (0.0, 0.75, 0.0):
+      m.body_gravcomp.fill_(value)
+      m.opt.graph_conditional = False
+      mjw.passive(m, d)
+      expected = d.qfrc_gravcomp.numpy().copy()
+      m.opt.graph_conditional = True
+      d.qfrc_gravcomp.fill_(wp.inf)
+      wp.capture_launch(capture.graph)
+      np.testing.assert_array_equal(d.qfrc_gravcomp.numpy(), expected)
+
   def test_polynomial_stiffness(self):
     """Tests polynomial stiffness."""
     xml = """

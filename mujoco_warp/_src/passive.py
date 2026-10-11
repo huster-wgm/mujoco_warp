@@ -387,6 +387,82 @@ def _gravity_force(deterministic: bool = False):
 
 
 @wp.kernel
+def _has_gravity_compensation(
+  # Model:
+  body_gravcomp: wp.array2d[float],
+  # Out:
+  active_out: wp.array[int],
+):
+  """Detect nonzero compensation on the device, including in-place model edits."""
+  row, body = wp.tid()
+  if body_gravcomp[row % body_gravcomp.shape[0], body + 1] != 0.0:
+    wp.atomic_max(active_out, 0, 1)  # kernel_analyzer: ignore[atomic]
+
+
+def _launch_gravity_force(m: Model, d: Data):
+  """Skip empty native reductions with a cached, device-conditional CUDA graph.
+
+  Nonzero compensation uses the original RUN_TO_RUN kernel and arithmetic.
+  The gate reads live model values on every invocation. Cache keys cover array
+  addresses and layouts, so replacement arrays and compacted worlds recapture.
+  Older Warp, CPU and graph-disabled execution retain the original path.
+  """
+  deterministic = bool(m.opt.deterministic & DeterminismType.ATOMICS)
+  inputs = [
+    m.opt.gravity,
+    m.body_parentid,
+    m.body_rootid,
+    m.body_mass,
+    m.body_gravcomp,
+    m.dof_bodyid,
+    m.body_isdofancestor,
+    d.xipos,
+    d.subtree_com,
+    d.cdof,
+  ]
+  outputs = [d.qfrc_gravcomp]
+  dim = (d.nworld, m.nbody - 1, m.nv)
+  device = d.qfrc_gravcomp.device
+
+  def launch():
+    """Retain the original native deterministic scatter kernel."""
+    wp.launch(_gravity_force(deterministic), dim=dim, inputs=inputs, outputs=outputs, device=device)
+
+  supported = tuple(map(int, wp.__version__.split(".")[:2])) >= (1, 18)
+  if not (deterministic and m.opt.graph_conditional and device.is_cuda and supported):
+    launch()
+    return
+
+  def conditional(active):
+    """Read the predicate entirely on GPU, including outside an outer graph."""
+    active.zero_()
+    wp.launch(
+      _has_gravity_compensation,
+      dim=(m.body_gravcomp.shape[0], m.nbody - 1),
+      inputs=[m.body_gravcomp],
+      outputs=[active],
+      device=device,
+    )
+    wp.capture_if(active, on_true=launch)
+
+  if device.is_capturing:
+    conditional(wp.zeros(1, dtype=int, device=device))
+    return
+
+  key = (dim, tuple((value.ptr, value.shape, value.strides) for value in inputs + outputs))
+  cached = getattr(d, "_gravity_force_graph", None)
+  if cached is None or cached[0] != key:
+    active = wp.zeros(1, dtype=int, device=device)
+    with wp.ScopedCapture(device=device) as capture:
+      conditional(active)
+    # Keep referenced arrays alive until this graph is replaced. Only one graph
+    # is retained per Data, even when live compaction changes the batch shape.
+    cached = (key, capture.graph, active, inputs, outputs)
+    d._gravity_force_graph = cached
+  wp.capture_launch(cached[1])
+
+
+@wp.kernel
 def _fluid_force(
   # Model:
   opt_wind: wp.array[wp.vec3],
@@ -3710,23 +3786,7 @@ def passive(m: Model, d: Data):
   gravity_enabled = not (m.opt.disableflags & DisableBit.GRAVITY)
   d.qfrc_gravcomp.zero_()
   if gravity_enabled:
-    wp.launch(
-      _gravity_force(bool(m.opt.deterministic & DeterminismType.ATOMICS)),
-      dim=(d.nworld, m.nbody - 1, m.nv),
-      inputs=[
-        m.opt.gravity,
-        m.body_parentid,
-        m.body_rootid,
-        m.body_mass,
-        m.body_gravcomp,
-        m.dof_bodyid,
-        m.body_isdofancestor,
-        d.xipos,
-        d.subtree_com,
-        d.cdof,
-      ],
-      outputs=[d.qfrc_gravcomp],
-    )
+    _launch_gravity_force(m, d)
 
   # Launch passive interp kernel for interpolated flex (trilinear/quadratic)
   if m.nflex and m.nflexintcell > 0:
