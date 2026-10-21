@@ -1013,8 +1013,9 @@ def _epa_witness(
       geom2.size[0] = radius
       geom2.margin = margin
     else:
-      x2 = wp.normalize(x2)
-      sp = support(geom2, geomtype2, x2)
+      # A witness position is not a support direction. Query towards the
+      # heightfield instead of selecting a vertex based on the world origin.
+      sp = support(geom2, geomtype2, -n)
       x2 = sp.point
 
     coordinates2 = _tri_affine_coord(a, b, c, x2)
